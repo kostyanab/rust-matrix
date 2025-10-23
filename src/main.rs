@@ -214,9 +214,6 @@ async fn login(
 
 /// Build a new client.
 async fn build_client(data_dir: &Path, homeserver: &str) -> Result<(Client, ClientSession)> {
-    // Ensure parent directory exists.
-    tokio::fs::create_dir_all(data_dir).await?;
-
     let mut rng = rng();
 
     // Each client gets its own SQLite folder.
