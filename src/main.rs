@@ -14,12 +14,13 @@ use matrix_sdk::{
         events::room::message::{MessageType, OriginalSyncRoomMessageEvent},
     },
 };
+
 use rand::{Rng, distr::Alphanumeric, rng};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 #[derive(Parser, Debug)]
-#[command(name = "alertbot", version, about = "Simple matrix alert bot")]
+#[command(name = "alertbot", version, about = "Matrix alert bot")]
 struct Cli {
     #[arg(long, env = "MATRIX_SERVER_URL")]
     server_url: String,
@@ -27,8 +28,12 @@ struct Cli {
     #[arg(long, env = "MATRIX_USERNAME")]
     username: String,
 
-    #[arg(long, env = "MATRIX_PASSWORD")]
+    #[arg(long, env = "MATRIX_PASSWORD", hide_env_values = true)]
     password: String,
+
+    /// Recovery Key или Passphrase для Secure Backup (CLI имеет приоритет над ENV).
+    #[arg(long, env = "MATRIX_RECOVERY_SECRET", hide_env_values = true)]
+    recovery_secret: Option<String>,
 }
 
 /// The data needed to re-build a client.
@@ -79,11 +84,15 @@ async fn main() -> Result<()> {
     let data_dir = dirs::data_dir()
         .expect("no data_dir directory found")
         .join("persist_session");
+    // Ensure directory exists early.
+    tokio::fs::create_dir_all(&data_dir).await?;
+
     // The file where the session is persisted.
     let session_file = data_dir.join("session");
+    info!("Session file: {}", session_file.display());
 
     let (client, sync_token) = if session_file.exists() {
-        restore_session(&session_file).await?
+        restore_session(&session_file, cli.recovery_secret.as_deref()).await?
     } else {
         (
             login(
@@ -92,6 +101,7 @@ async fn main() -> Result<()> {
                 &cli.username,
                 &cli.password,
                 &cli.server_url,
+                cli.recovery_secret.as_deref(),
             )
             .await?,
             None,
@@ -102,7 +112,10 @@ async fn main() -> Result<()> {
 }
 
 /// Restore a previous session.
-async fn restore_session(session_file: &Path) -> Result<(Client, Option<String>)> {
+async fn restore_session(
+    session_file: &Path,
+    recovery_secret: Option<&str>,
+) -> Result<(Client, Option<String>)> {
     info!(
         "Previous session found in '{}'",
         session_file.to_string_lossy()
@@ -128,6 +141,19 @@ async fn restore_session(session_file: &Path) -> Result<(Client, Option<String>)
     // Restore the Matrix user session.
     client.restore_session(user_session).await?;
 
+    // Try to recover Secure Backup using provided secret (if any).
+    if let Some(secret) = recovery_secret {
+        match client.encryption().recovery().recover(secret).await {
+            Ok(()) => {
+                info!("Secure Backup successfully recovered (restore_session)");
+                if let Err(e) = client.encryption().backups().wait_for_steady_state().await {
+                    error!("Backup steady-state wait failed: {e}");
+                }
+            }
+            Err(err) => error!("Secure Backup recovery failed: {err}"),
+        }
+    }
+
     Ok((client, sync_token))
 }
 
@@ -138,6 +164,7 @@ async fn login(
     username: &str,
     password: &str,
     client_url: &str,
+    recovery_secret: Option<&str>,
 ) -> Result<Client> {
     info!("No previous session found, logging in…");
 
@@ -146,13 +173,25 @@ async fn login(
 
     matrix_auth
         .login_username(username, password)
-        .initial_device_display_name("persist-session client")
+        .initial_device_display_name("AlertBot")
         .await?;
 
+    // Recover Secure Backup after login if secret provided.
+    if let Some(secret) = recovery_secret {
+        match client.encryption().recovery().recover(secret).await {
+            Ok(()) => {
+                info!("Secure Backup successfully recovered using recovery secret");
+                if let Err(e) = client.encryption().backups().wait_for_steady_state().await {
+                    error!("Backup steady-state wait failed: {e}");
+                }
+            }
+            Err(err) => error!("Failed to recover Secure Backup: {err}"),
+        }
+    } else {
+        info!("No recovery secret provided, skipping Secure Backup recovery");
+    }
+
     // Persist the session to reuse it later.
-    // This is not very secure, for simplicity. If the system provides a way of
-    // storing secrets securely, it should be used instead.
-    // Note that we could also build the user session from the login response.
     let user_session = matrix_auth
         .session()
         .expect("A logged-in client should have a session");
@@ -161,26 +200,22 @@ async fn login(
         user_session,
         sync_token: None,
     })?;
+    tokio::fs::create_dir_all(data_dir).await?;
     fs::write(session_file, serialized_session).await?;
 
     info!("Session persisted in {}", session_file.to_string_lossy());
-
-    // After logging in, you might want to verify this session with another one (see
-    // the `emoji_verification` example), or bootstrap cross-signing if this is your
-    // first session with encryption, or if you need to reset cross-signing because
-    // you don't have access to your old sessions (see the
-    // `cross_signing_bootstrap` example).
 
     Ok(client)
 }
 
 /// Build a new client.
 async fn build_client(data_dir: &Path, homeserver: &str) -> Result<(Client, ClientSession)> {
+    // Ensure parent directory exists.
+    tokio::fs::create_dir_all(data_dir).await?;
+
     let mut rng = rng();
 
-    // Generating a subfolder for the database is not mandatory, but it is useful if
-    // you allow several clients to run at the same time. Each one must have a
-    // separate database, which is a different folder with the SQLite store.
+    // Each client gets its own SQLite folder.
     let db_subfolder: String = (&mut rng)
         .sample_iter(Alphanumeric)
         .take(7)
@@ -234,14 +269,10 @@ async fn sync(
     }
 
     // Let's ignore messages before the program was launched.
-    // This is a loop in case the initial sync is longer than our timeout. The
-    // server should cache the response and it will ultimately take less time to
-    // receive.
     loop {
         match client.sync_once(sync_settings.clone()).await {
             Ok(response) => {
-                // This is the last time we need to provide this token, the sync method after
-                // will handle it on its own.
+                // Hand over next_batch to the following syncs and persist it.
                 sync_settings = sync_settings.token(response.next_batch.clone());
                 persist_sync_token(session_file, response.next_batch).await?;
                 break;
@@ -263,7 +294,7 @@ async fn sync(
         .sync_with_result_callback(sync_settings, |sync_result| async move {
             let response = sync_result?;
 
-            // We persist the token each time to be able to restore our session
+            // Persist the token each time to be able to restore our session
             persist_sync_token(session_file, response.next_batch)
                 .await
                 .map_err(|err| Error::UnknownError(err.into()))?;
