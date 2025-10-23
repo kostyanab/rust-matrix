@@ -72,7 +72,11 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::from_default_env()
+                .add_directive("matrix_sdk=warn".parse().unwrap())
+                .add_directive("matrix_sdk_crypto=warn".parse().unwrap()),
+        )
         .with_target(false)
         .compact()
         .init();
